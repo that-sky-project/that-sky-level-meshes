@@ -2,14 +2,16 @@
 
 That Sky Level `.meshes` 网格文件的纯 Python 转换器，支持四种转换方向，零依赖，可在 Termux 等移动环境直接运行。
 
-县小威移植 [that-sky-project/that-sky-level](https://github.com/that-sky-project/that-sky-level)，meshopt 顶点编解码器用纯 Python 重写，无需任何原生模块。
+移植自 [that-sky-project/that-sky-level](https://github.com/that-sky-project/that-sky-level)，meshopt 顶点编解码器用纯 Python 重写，无需任何原生模块。
 
 ## 功能
 
 | 方向 | 说明 |
 |------|------|
 | `.meshes` → `.obj` | 网格转 OBJ (touch_object) |
+| `.meshes` → 多个 `.obj` | 按材质拆分 (顶点取权重最大材质, 面取多数投票) |
 | `.obj` → `.meshes` | OBJ 转网格 (BFS 邻接分块算法) |
+| 多个 `.obj` → `.meshes` | 交互式菜单选择, 按文件名确定材质, 交界处权重过渡 |
 | `.meshes` → `.json` | 网格转 JSON (全部字段可视化) |
 | `.json` → `.meshes` | JSON 转网格 (精确还原) |
 
@@ -41,6 +43,31 @@ python3 meshes2obj.py -i level.meshes --info
 
 ```bash
 python3 meshes2obj.py -i in.meshes -o out --mode m2o   # m2o / o2m / m2j / j2m
+```
+
+### 按材质拆分 OBJ
+
+将 `.meshes` 中混合的多种材质拆分为独立的 OBJ 文件，每个材质一个：
+
+```bash
+# 按顶点权重投票拆分 (默认)
+python3 meshes2obj.py -i level.meshes -o output --split-material
+# 产出: output_Cliff.obj, output_Grass.obj, output_Sand.obj, ...
+
+# 使用 subchunk 材质区间 (游戏原始分配)
+python3 meshes2obj.py -i level.meshes -o output --split-material --use-subchunk
+```
+
+### 多 OBJ 合并为 meshes
+
+将多个不同材质的 OBJ 合并为一个 `.meshes`，文件名确定材质，交界处顶点自动权重过渡：
+
+```bash
+# 交互式菜单 (推荐)
+python3 meshes2obj.py --multi-obj -o merged.meshes
+
+# 指定起始目录
+python3 meshes2obj.py --multi-obj --dir /path/to/obj_files -o merged.meshes
 ```
 
 ## JSON 格式
@@ -209,6 +236,40 @@ python3 meshes2obj.py -i in.meshes -o out --mode m2o   # m2o / o2m / m2j / j2m
 | 28 | 4 | 输入通道 3 (细节, UNORM) |
 | 32 | 4 | 输入通道 4 (其他, UNORM) |
 
+## meshes → OBJ 说明
+
+### 单文件输出 (默认)
+
+```bash
+python3 meshes2obj.py -i level.meshes -o level.obj
+python3 meshes2obj.py -i level.meshes -o level.obj --merge   # 合并为单个对象
+```
+
+所有材质的顶点和面混合输出到一个 OBJ 文件。
+
+### 按材质拆分 (--split-material)
+
+将混合多种材质的 `.meshes` 拆分为多个独立 OBJ，每个材质一个文件：
+
+```bash
+python3 meshes2obj.py -i level.meshes -o output --split-material
+# 产出: output_Cliff.obj, output_Grass.obj, output_Sand.obj, ...
+```
+
+拆分规则：
+
+- **顶点归属**：每个顶点有 4 个材质槽，取权重最大的槽作为该顶点的主材质
+- **面归属**：对每个三角形的 3 个顶点做多数投票，票数最多的主材质即为该面的材质；平局时取权重最高的顶点材质
+- **输出**：每个 OBJ 只包含该材质的面及其引用的顶点，顶点索引重映射为局部连续编号
+
+使用 `--use-subchunk` 时，面的材质直接读取 subchunk 的 `material_id` 和 `triangle_range`（游戏原始分配），而非顶点权重投票：
+
+```bash
+python3 meshes2obj.py -i level.meshes -o output --split-material --use-subchunk
+```
+
+拆分与多 OBJ 合并互为逆操作，可配合使用形成完整闭环。
+
 ## OBJ → meshes 说明
 
 反向转换时使用 BFS 邻接分块算法（移植自 `adjacency.js`），约束：
@@ -218,14 +279,65 @@ python3 meshes2obj.py -i in.meshes -o out --mode m2o   # m2o / o2m / m2j / j2m
 - 未指定材质时默认 Grass (ID 48)
 - input2/3/4 使用默认值：0.99 / 0.5 / 0.04
 
+### 单 OBJ 模式
+
+```bash
+python3 meshes2obj.py -i model.obj -o model.meshes
+```
+
+每个顶点只填充一个材质槽，权重 1.0。材质通过 OBJ 中的 `usemtl` 指令确定，未指定时默认 Grass。
+
+### 多 OBJ 模式 (--multi-obj)
+
+输入多个不同材质的 OBJ，合并为一个 `.meshes`。核心机制：
+
+**材质识别** — 从文件名提取材质名，匹配顺序：精确匹配 > 分隔符后缀 > 包含匹配。例如 `output_Cliff.obj` → Cliff (ID 16)，`model_Grass_test.obj` → Grass (ID 48)。
+
+**顶点合并** — 所有 OBJ 的顶点按坐标（6 位精度）去重合并。相同位置的顶点合并为一个，法线从合并后的面几何重新计算，保证跨 OBJ 一致。
+
+**权重过渡** — 交界处顶点（被多个材质的面引用）按各材质面数比例分配权重，填入 4 个材质槽。例如某顶点被 2 个 Cliff 面 + 1 个 Grass 面引用，则 Cliff 权重 0.67、Grass 权重 0.33。
+
+**面材质** — 多材质模式下每个面的材质直接取自所属 OBJ 的文件名（而非顶点投票），subchunk 按面材质划分。
+
+交互式菜单操作：
+
+```
+============================================================
+当前目录: /path/to/obj_files
+已选 2 个文件:
+  [0] model_Cliff.obj -> Cliff
+  [1] model_Grass.obj -> Grass
+------------------------------------------------------------
+   1.  [上级目录] ..
+   2.  [文件夹] sub/
+   3.  [OBJ] * model_Cliff.obj  (Cliff)
+   4.  [OBJ]   model_Grass.obj  (Grass)
+------------------------------------------------------------
+操作: 输入序号选择/取消 OBJ, 'a' 全选当前目录, 'c' 清空, 'd' 完成, 'q' 取消
+```
+
+| 输入 | 作用 |
+|------|------|
+| 数字 | 选择/取消对应项（文件夹=进入，OBJ=选中/取消） |
+| `a` | 全选当前目录所有 OBJ |
+| `c` | 清空已选 |
+| `d` | 完成选择，进入输出确认 |
+| `q` | 取消退出 |
+
+选中的 OBJ 后面标记 `*`，可跨目录选择。
+
 ## 命令行参数
 
 ```
--i, --input     输入文件路径（必需）
--o, --output    输出文件路径（省略时输出到 stdout）
--m, --merge     meshes->obj 时合并为单个对象
-    --info      仅打印文件信息
-    --mode      显式指定转换方向: m2o / o2m / m2j / j2m
+-i, --input          输入文件路径 (--multi-obj 模式下可省略)
+-o, --output         输出文件路径 (省略时输出到 stdout)
+-m, --merge          meshes->obj 时合并为单个对象
+    --info           仅打印文件信息
+    --split-material meshes->obj 时按材质拆分多个 OBJ
+    --use-subchunk   配合 --split-material: 使用 subchunk 材质区间而非顶点权重
+    --multi-obj      启动交互式菜单选择多个 OBJ, 合并为 meshes
+    --dir PATH       交互式菜单的起始目录 (配合 --multi-obj)
+    --mode           显式指定转换方向: m2o / o2m / m2j / j2m
 ```
 
 ## 许可证
