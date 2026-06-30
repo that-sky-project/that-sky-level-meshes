@@ -2,7 +2,7 @@
 
 That Sky Level `.meshes` 网格文件的纯 Python 转换器，支持四种转换方向，零依赖，可在 Termux 等移动环境直接运行。
 
-移植自 [that-sky-project/that-sky-level](https://github.com/that-sky-project/that-sky-level)，meshopt 顶点编解码器用纯 Python 重写，无需任何原生模块。
+县小威移植 [that-sky-project/that-sky-level](https://github.com/that-sky-project/that-sky-level)，meshopt 顶点编解码器用纯 Python 重写，无需任何原生模块。
 
 ## 功能
 
