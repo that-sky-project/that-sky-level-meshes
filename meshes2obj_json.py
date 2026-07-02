@@ -1,22 +1,33 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-meshes2obj.py - That Sky Level .meshes 全方位转换器 (纯 Python, 适配 Termux)
+meshes2obj_json.py - That Sky Level .meshes 全方位转换器 (纯 Python, 适配 Termux)
 
-支持四种转换方向:
-    .meshes -> .obj     网格 -> OBJ (touch_object)
-    .obj    -> .meshes  OBJ -> 网格 (邻接分块算法)
-    .meshes -> .json    网格 -> JSON (全部数据, 可视化)
-    .json   -> .meshes  JSON -> 网格 (从 JSON 重建二进制)
+支持以下转换方向:
+    .meshes -> .obj (可逆)   网格 -> OBJ (含全部信息, 建模软件可读, 可直接转回)
+    .meshes -> .obj (标准)   网格 -> OBJ (仅几何, touch_object)
+    .obj    -> .meshes       OBJ -> 网格 (自动检测: 可逆OBJ精确还原 / 标准OBJ邻接分块)
+    .meshes -> .json         网格 -> JSON (全部数据, 可视化)
+    .json   -> .meshes       JSON -> 网格 (从 JSON 重建二进制)
 
 用法:
-    python3 meshes2obj.py -i input.meshes -o output.obj       # meshes -> obj
-    python3 meshes2obj.py -i input.obj -o output.meshes       # obj -> meshes
-    python3 meshes2obj.py -i input.meshes -o output.json      # meshes -> json
-    python3 meshes2obj.py -i input.json -o output.meshes      # json -> meshes
-    python3 meshes2obj.py -i input.meshes --info              # 仅打印文件信息
+    # 交互式菜单 (推荐, 无参数启动)
+    python3 meshes2obj_json.py
 
-转换方向根据输入/输出文件扩展名自动判断, 也可用 --mode 显式指定。
+    # 命令行
+    python3 meshes2obj_json.py -i input.meshes -o output.obj --full   # meshes -> 可逆 obj
+    python3 meshes2obj_json.py -i input.meshes -o output.obj          # meshes -> 标准 obj
+    python3 meshes2obj_json.py -i input.obj -o output.meshes          # obj -> meshes
+    python3 meshes2obj_json.py -i input.meshes -o output.json         # meshes -> json
+    python3 meshes2obj_json.py -i input.json -o output.meshes         # json -> meshes
+    python3 meshes2obj_json.py -i input.meshes --info                 # 仅打印文件信息
+
+转换方向根据输入/输出文件扩展名自动判断, 也可用 --mode 显式指定:
+    m2o  = meshes->obj (标准)    m2of = meshes->obj (可逆)
+    o2m  = obj->meshes           m2j  = meshes->json    j2m = json->meshes
+
+可逆 OBJ 格式: 标准 OBJ 几何 (v/vn/f) + # @ 注释嵌入完整 meshes 元数据。
+建模软件 (Blender/Maya 等) 可正常读取几何; 转换器读取元数据可字节级无损还原。
 
 移植自 https://github.com/that-sky-project/that-sky-level
 仅依赖 Python 标准库, meshopt 编解码用纯 Python 重写, 无需任何原生模块。
@@ -570,6 +581,44 @@ def _material_from_filename(filepath):
         if mat_name in name:
             return mat_name
     return "None"
+
+
+def _is_reversible_obj(filepath):
+    """检测 OBJ 文件是否为可逆格式 (含 @MESHES_META 元数据块)。
+
+    从文件末尾向前分块搜索, 确保即使元数据块很大也能找到 META_BEGIN 标记。
+    """
+    marker = META_BEGIN
+    marker_len = len(marker)
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            # 小文件: 直接全读
+            f.seek(0, 2)
+            size = f.tell()
+            if size <= 65536:
+                f.seek(0)
+                return marker in f.read()
+
+            # 大文件: 从末尾向前分块搜索
+            # META_BEGIN 在元数据块开头, 元数据块在文件末尾
+            # 每个顶点的 @vraw 行约 80 字节, 大量顶点时元数据块可能很大
+            chunk_size = 65536  # 每次读 64KB
+            overlap = marker_len + 10  # 重叠区, 防止标记跨块
+
+            pos = size
+            while pos > 0:
+                read_start = max(0, pos - chunk_size)
+                read_len = pos - read_start
+                f.seek(read_start)
+                block = f.read(read_len)
+                if marker in block:
+                    return True
+                if read_start == 0:
+                    break
+                pos = read_start + overlap  # 重叠, 防止标记跨块
+            return False
+    except Exception:
+        return False
 
 
 # ============================================================
@@ -1132,6 +1181,149 @@ def touch_object(meshes, merge=False):
 
 
 # ============================================================
+#  可逆 OBJ: 标准 OBJ 几何 + 嵌入完整 meshes 元数据
+#  建模软件可正常读取 v/vn/f; 转换器读取 # @ 注释完整还原 .meshes
+# ============================================================
+META_BEGIN = "# @MESHES_META_BEGIN"
+META_END = "# @MESHES_META_END"
+
+
+def _write_obj_meta(out_list, meshes, geo):
+    """将完整 meshes 元数据写入 # @ 注释块, 追加到 out_list。"""
+    ap = out_list.append
+    ap(META_BEGIN + "\n")
+
+    # ---- 版本和包围盒 ----
+    ap("# @version 0x%X\n" % meshes.version)
+    if geo:
+        ap("# @meshopt_version %d\n" % getattr(geo, 'meshopt_version', 0))
+    ap("# @bounds_max %s %s %s\n" % (
+        _fmt(meshes.max_pos[0]), _fmt(meshes.max_pos[1]), _fmt(meshes.max_pos[2])))
+    ap("# @bounds_min %s %s %s\n" % (
+        _fmt(meshes.min_pos[0]), _fmt(meshes.min_pos[1]), _fmt(meshes.min_pos[2])))
+
+    # ---- DESC / LOD0 原始字节 (hex, 保证精确还原) ----
+    if meshes.desc_raw is not None:
+        ap("# @desc_raw %s\n" % meshes.desc_raw.hex())
+    if meshes.lod_raw is not None:
+        ap("# @lod0_raw %s\n" % meshes.lod_raw.hex())
+
+    if not geo:
+        ap(META_END + "\n")
+        return
+
+    # ---- 计数 ----
+    ap("# @counts %d %d %d %d %d\n" % (
+        geo.vertex_count, geo.index_count,
+        geo.chunk_count, geo.cloud_chunk_count, geo.subchunk_count))
+
+    # ---- 顶点原始字节 (36 字节/顶点, hex, 保证字节级无损) ----
+    for i, v in enumerate(geo.vertices):
+        ap("# @vraw %d %s\n" % (i, v.raw.hex()))
+
+    # ---- 分块 (含地形块 + 云块) ----
+    for i, c in enumerate(geo.chunks):
+        pad = c.pad if c.pad else (0, 0, 0, 0)
+        ap("# @chunk %d %d %d %d %d %d %d %s %s %s %s %s %s %d %d %d %d\n" % (
+            i, c.idx_start, c.idx_count, c.vtx_start, c.vtx_count,
+            c.subchunk_start, c.subchunk_count,
+            _fmt(c.min[0]), _fmt(c.min[1]), _fmt(c.min[2]),
+            _fmt(c.max[0]), _fmt(c.max[1]), _fmt(c.max[2]),
+            pad[0], pad[1], pad[2], pad[3]))
+
+    # ---- 材质子区间 ----
+    for i, sc in enumerate(geo.subchunks):
+        ap("# @subchunk %d %d %d %d %d %d %d %d\n" % (
+            i, sc.material_id, sc.triangle_count, sc.vtx_count,
+            sc.triangle_start, sc.triangle_end, sc.vtx_start, sc.vtx_end))
+
+    # ---- 索引 (分组输出, 每行最多 256 个) ----
+    li = geo.local_indices
+    for i in range(0, len(li), 256):
+        group = li[i:i + 256]
+        ap("# @indices %s\n" % " ".join(str(x) for x in group))
+
+    ap(META_END + "\n")
+
+
+def meshes_to_obj_full(meshes):
+    """生成可逆 OBJ: 标准 OBJ 几何 + 嵌入完整 meshes 元数据。
+
+    - 建模软件 (Blender/Maya 等) 可正常读取 v/vn/f 几何数据
+    - 转换器读取 # @ 注释块可完整还原 .meshes (字节级无损)
+    - 等价于 meshes→json 的信息量, 但以 OBJ 格式呈现
+    """
+    geo = meshes.geo
+    out = []
+    ap = out.append
+
+    # ---- 文件头 ----
+    ap("# ============================================================\n")
+    ap("# That Sky Level Meshes OBJ (可逆格式)\n")
+    ap("# 版本: 0x%X\n" % meshes.version)
+    ap("# 此文件包含标准 OBJ 几何 + 嵌入的 .meshes 元数据\n")
+    ap("# 建模软件可正常读取 v/vn/f; 转换器读取 # @ 注释完整还原\n")
+    ap("# ============================================================\n\n")
+
+    if not geo or geo.vertex_count == 0:
+        ap("# (无几何数据)\n")
+        _write_obj_meta(out, meshes, geo)
+        return "".join(out)
+
+    # ---- 顶点位置 ----
+    for v in geo.vertices:
+        ap("v %s %s %s\n" % (_fmt(v.pos[0]), _fmt(v.pos[1]), _fmt(v.pos[2])))
+    ap("\n")
+
+    # ---- 顶点法线 ----
+    for v in geo.vertices:
+        n = v.normal
+        ap("vn %s %s %s\n" % (_fmt(n[0]), _fmt(n[1]), _fmt(n[2])))
+    ap("\n")
+
+    # ---- 面 (按 chunk + subchunk 材质分组输出) ----
+    li = geo.local_indices
+    chunks = geo.chunks
+
+    for ci in range(geo.chunk_count):
+        chunk = chunks[ci]
+        ap("o Chunk_%d\n" % ci)
+        idx_start = chunk.idx_start
+        vtx_start = chunk.vtx_start
+        idx_count = chunk.idx_count
+
+        if chunk.subchunk_count > 0:
+            # 按 subchunk 材质区间输出面
+            for si in range(chunk.subchunk_count):
+                sc = geo.subchunks[chunk.subchunk_start + si]
+                mat_name = K_MATERIAL_REVERSE.get(sc.material_id, "Unknown_%d" % sc.material_id)
+                ap("usemtl %s\n" % mat_name)
+                for tri in range(sc.triangle_start, sc.triangle_start + sc.triangle_count):
+                    j = tri * 3
+                    if j + 2 >= idx_count:
+                        break
+                    a = vtx_start + li[idx_start + j] + 1
+                    b = vtx_start + li[idx_start + j + 1] + 1
+                    c = vtx_start + li[idx_start + j + 2] + 1
+                    ap("f %d//%d %d//%d %d//%d\n" % (a, a, b, b, c, c))
+        else:
+            # 无 subchunk, 直接输出所有面
+            j = 0
+            while j < idx_count:
+                a = vtx_start + li[idx_start + j] + 1
+                b = vtx_start + li[idx_start + j + 1] + 1
+                c = vtx_start + li[idx_start + j + 2] + 1
+                ap("f %d//%d %d//%d %d//%d\n" % (a, a, b, b, c, c))
+                j += 3
+        ap("\n")
+
+    # ---- 元数据块 (用于精确还原) ----
+    _write_obj_meta(out, meshes, geo)
+
+    return "".join(out)
+
+
+# ============================================================
 #  多材质 OBJ 拆分输出
 # ============================================================
 def touch_object_multi(meshes, output_path, use_subchunk=False):
@@ -1684,8 +1876,159 @@ def _assign_chunk(start, unprocessed, visited_face, vertices, faces):
     return chunk
 
 
+def obj_to_meshes_full(obj_text):
+    """从可逆 OBJ 的 @MESHES_META 元数据块精确重建 LevelMeshes (字节级无损)。
+
+    与 meshes_to_obj_full 互为逆操作, 不使用 BFS 邻接分块算法,
+    直接从嵌入的元数据恢复原始结构。
+    """
+    if META_BEGIN not in obj_text:
+        raise ValueError("OBJ 文件不包含 @MESHES_META 元数据块, 无法精确还原")
+
+    lines = obj_text.split("\n")
+    in_meta = False
+    meta_lines = []
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped == META_BEGIN:
+            in_meta = True
+            continue
+        if stripped == META_END:
+            break
+        if in_meta and stripped.startswith("# @"):
+            meta_lines.append(stripped[3:])
+
+    if not meta_lines:
+        raise ValueError("元数据块为空, 无法还原")
+
+    # ---- 解析元数据 ----
+    version = 0x3C
+    meshopt_version = 0
+    max_pos = (FLT_MAX, FLT_MAX, FLT_MAX)
+    min_pos = (-FLT_MAX, -FLT_MAX, -FLT_MAX)
+    desc_raw = None
+    lod_raw = None
+    counts = None
+    vraw_dict = {}
+    chunks_data = []
+    subchunks_data = []
+    indices = []
+
+    for ml in meta_lines:
+        parts = ml.split(None, 1)
+        tag = parts[0]
+        rest = parts[1].strip() if len(parts) > 1 else ""
+
+        if tag == "version":
+            version = int(rest, 16)
+        elif tag == "meshopt_version":
+            meshopt_version = int(rest)
+        elif tag == "bounds_max":
+            v = rest.split()
+            max_pos = (float(v[0]), float(v[1]), float(v[2]))
+        elif tag == "bounds_min":
+            v = rest.split()
+            min_pos = (float(v[0]), float(v[1]), float(v[2]))
+        elif tag == "desc_raw":
+            desc_raw = bytes.fromhex(rest)
+        elif tag == "lod0_raw":
+            lod_raw = bytes.fromhex(rest)
+        elif tag == "counts":
+            counts = [int(x) for x in rest.split()]
+        elif tag == "vraw":
+            sp = rest.split(None, 1)
+            idx = int(sp[0])
+            vraw_dict[idx] = bytes.fromhex(sp[1]) if len(sp) > 1 else b""
+        elif tag == "chunk":
+            chunks_data.append(rest.split())
+        elif tag == "subchunk":
+            subchunks_data.append(rest.split())
+        elif tag == "indices":
+            indices.extend(int(x) for x in rest.split())
+
+    # ---- 构建 LevelMeshes ----
+    m = LevelMeshes()
+    m.version = version
+    m.max_pos = max_pos
+    m.min_pos = min_pos
+    m.desc_raw = desc_raw
+    m.desc = _parse_desc(desc_raw) if desc_raw else None
+    m.lod_raw = lod_raw if lod_raw else LOD0_FIXED_BYTES
+    m.toc = None
+
+    geo = LevelGeo()
+    if counts:
+        geo.vertex_count = counts[0]
+        geo.index_count = counts[1]
+        geo.chunk_count = counts[2]
+        geo.cloud_chunk_count = counts[3]
+        geo.subchunk_count = counts[4]
+    else:
+        geo.vertex_count = len(vraw_dict)
+        geo.index_count = len(indices)
+        geo.chunk_count = len(chunks_data)
+        geo.cloud_chunk_count = 0
+        geo.subchunk_count = len(subchunks_data)
+    geo.meshopt_version = meshopt_version
+
+    # 顶点 (从原始 36 字节重建, 字节级无损)
+    geo.vertices = []
+    for i in range(geo.vertex_count):
+        raw = vraw_dict.get(i)
+        if raw is None:
+            raw = b"\x00" * VERTEX_SIZE
+        geo.vertices.append(LevelGeoVertex.from_raw(raw))
+
+    # 索引
+    geo.local_indices = indices
+
+    # 分块
+    geo.chunks = []
+    for vals in chunks_data:
+        # @chunk <idx> <idx_start> <idx_count> <vtx_start> <vtx_count>
+        #         <sub_start> <sub_count> <minx> <miny> <minz>
+        #         <maxx> <maxy> <maxz> <pad0> <pad1> <pad2> <pad3>
+        c = LevelGeoChunk()
+        c.idx_start = int(vals[1])
+        c.idx_count = int(vals[2])
+        c.vtx_start = int(vals[3])
+        c.vtx_count = int(vals[4])
+        c.subchunk_start = int(vals[5])
+        c.subchunk_count = int(vals[6])
+        c.min = (float(vals[7]), float(vals[8]), float(vals[9]))
+        c.max = (float(vals[10]), float(vals[11]), float(vals[12]))
+        c.pad = (int(vals[13]), int(vals[14]), int(vals[15]), int(vals[16]))
+        geo.chunks.append(c)
+
+    # 子区间
+    geo.subchunks = []
+    for vals in subchunks_data:
+        # @subchunk <idx> <mat_id> <tri_count> <vtx_count>
+        #           <tri_start> <tri_end> <vtx_start> <vtx_end>
+        sc = LevelGeoSubchunk()
+        sc.material_id = int(vals[1])
+        sc.triangle_count = int(vals[2])
+        sc.vtx_count = int(vals[3])
+        sc.triangle_start = int(vals[4])
+        sc.triangle_end = int(vals[5])
+        sc.vtx_start = int(vals[6])
+        sc.vtx_end = int(vals[7])
+        geo.subchunks.append(sc)
+
+    m.geo = geo
+    return m
+
+
 def obj_to_meshes(obj_text):
-    """OBJ 文本 -> LevelMeshes 对象。"""
+    """OBJ 文本 -> LevelMeshes 对象。
+
+    自动检测: 若 OBJ 包含 @MESHES_META 元数据块, 使用精确还原 (字节级无损);
+    否则使用 BFS 邻接分块算法 (从零重建, 适用于普通 OBJ)。
+    """
+    if META_BEGIN in obj_text:
+        return obj_to_meshes_full(obj_text)
+
     vertices, faces = parse_obj(obj_text)
     geo = obj_to_geo(vertices, faces)
 
@@ -1865,6 +2208,179 @@ def multi_obj_to_meshes(obj_paths):
     }
     m.desc_raw = _nbt_write_desc(m.desc)
     m.lod_raw = LOD0_FIXED_BYTES
+    m.geo = geo
+    m.toc = None
+    return m
+
+
+def multi_obj_to_meshes_mixed(standard_paths, full_paths):
+    """合并标准 OBJ + 可逆 OBJ (非法OBJ) → LevelMeshes 对象。
+
+    - 标准 OBJ: 通过 parse_multi_obj + obj_to_geo 处理 (邻接分块, 材质来自文件名)
+    - 可逆 OBJ: 通过 obj_to_meshes_full 精确还原 (保留全部顶点数据/分块/子区间)
+    - 两类几何直接拼接: 顶点/索引/分块/子区间依次追加, 偏移量自动调整
+    - LOD0/DESC/meshopt_version 从第一个可逆 OBJ 继承 (保留烘焙贴图/光照数据)
+    - bounds 从所有顶点实际坐标计算
+
+    standard_paths: 标准 OBJ 文件路径列表 (可空)
+    full_paths: 可逆 OBJ 文件路径列表 (可空)
+    """
+    if not standard_paths and not full_paths:
+        raise ValueError("未提供任何 OBJ 文件")
+
+    all_vertices = []
+    all_indices = []
+    all_chunks = []
+    all_subchunks = []
+    terrain_chunk_count = 0
+    cloud_chunk_count = 0
+
+    # 从可逆 OBJ 继承的元数据 (LOD0/DESC/meshopt_version)
+    inherited_lod_raw = None
+    inherited_desc_raw = None
+    inherited_meshopt_version = 0
+
+    # ---- 1. 处理标准 OBJ ----
+    if standard_paths:
+        print("\n--- 处理标准 OBJ (%d 个) ---" % len(standard_paths))
+        vertices, faces, vertex_materials_multi = parse_multi_obj(standard_paths)
+        print("\n正在执行邻接分块...")
+        geo_std = obj_to_geo(vertices, faces, vertex_materials_multi)
+
+        all_vertices.extend(geo_std.vertices)
+        all_indices.extend(geo_std.local_indices)
+        all_chunks.extend(geo_std.chunks)
+        all_subchunks.extend(geo_std.subchunks)
+        terrain_chunk_count += geo_std.chunk_count
+        cloud_chunk_count += geo_std.cloud_chunk_count
+
+        print("  标准 OBJ: %d 顶点, %d 索引, %d 分块" % (
+            geo_std.vertex_count, geo_std.index_count, geo_std.chunk_count))
+
+    # ---- 2. 处理可逆 OBJ (非法OBJ) ----
+    for i, fp in enumerate(full_paths):
+        print("\n--- 处理可逆 OBJ (%d/%d): %s ---" % (i + 1, len(full_paths), os.path.basename(fp)))
+        with open(fp, "r", encoding="utf-8") as f:
+            obj_text = f.read()
+
+        meshes = obj_to_meshes_full(obj_text)
+        geo = meshes.geo
+
+        if not geo or geo.vertex_count == 0:
+            print("  跳过: 无几何数据")
+            continue
+
+        # 第一个可逆 OBJ: 继承 LOD0/DESC/meshopt_version
+        if inherited_lod_raw is None:
+            inherited_lod_raw = meshes.lod_raw
+            inherited_desc_raw = meshes.desc_raw
+            inherited_meshopt_version = getattr(geo, 'meshopt_version', 0)
+            if inherited_lod_raw and len(inherited_lod_raw) > len(LOD0_FIXED_BYTES):
+                print("  继承 LOD0: %d 字节 (含烘焙贴图/光照数据)" % len(inherited_lod_raw))
+            else:
+                print("  继承 LOD0: %d 字节 (默认)" % len(inherited_lod_raw) if inherited_lod_raw else "  LOD0: 无")
+            if inherited_desc_raw:
+                print("  继承 DESC: %d 字节" % len(inherited_desc_raw))
+
+        vtx_offset = len(all_vertices)
+        idx_offset = len(all_indices)
+        sub_offset = len(all_subchunks)
+
+        # 顶点直接追加 (保留完整 36 字节原始数据)
+        all_vertices.extend(geo.vertices)
+
+        # 索引直接追加 (local_indices 相对于各 chunk 的 vtx_start, 无需偏移)
+        all_indices.extend(geo.local_indices)
+
+        # 分块: 调整 idx_start / vtx_start / subchunk_start
+        for c in geo.chunks:
+            new_c = LevelGeoChunk()
+            new_c.idx_start = c.idx_start + idx_offset
+            new_c.vtx_start = c.vtx_start + vtx_offset
+            new_c.subchunk_start = c.subchunk_start + sub_offset
+            new_c.idx_count = c.idx_count
+            new_c.vtx_count = c.vtx_count
+            new_c.subchunk_count = c.subchunk_count
+            new_c.min = c.min
+            new_c.max = c.max
+            new_c.pad = c.pad if c.pad else (0, 0, 0, 0)
+            all_chunks.append(new_c)
+
+        terrain_chunk_count += geo.chunk_count
+        cloud_chunk_count += geo.cloud_chunk_count
+
+        # 子区间直接追加
+        all_subchunks.extend(geo.subchunks)
+
+        print("  可逆 OBJ: %d 顶点, %d 索引, %d 分块 (%d 地形 + %d 云)" % (
+            geo.vertex_count, geo.index_count,
+            geo.chunk_count + geo.cloud_chunk_count,
+            geo.chunk_count, geo.cloud_chunk_count))
+
+    # ---- 3. 构建合并后的 geo ----
+    geo = LevelGeo()
+    geo.vertices = all_vertices
+    geo.vertex_count = len(all_vertices)
+    geo.local_indices = all_indices
+    geo.index_count = len(all_indices)
+    geo.chunks = all_chunks
+    geo.chunk_count = terrain_chunk_count
+    geo.cloud_chunk_count = cloud_chunk_count
+    geo.subchunks = all_subchunks
+    geo.subchunk_count = len(all_subchunks)
+    geo.meshopt_version = inherited_meshopt_version
+
+    # ---- 4. 计算实际包围盒 (从所有顶点位置) ----
+    if all_vertices:
+        min_x = min(v.pos[0] for v in all_vertices)
+        min_y = min(v.pos[1] for v in all_vertices)
+        min_z = min(v.pos[2] for v in all_vertices)
+        max_x = max(v.pos[0] for v in all_vertices)
+        max_y = max(v.pos[1] for v in all_vertices)
+        max_z = max(v.pos[2] for v in all_vertices)
+        computed_max = (max_x, max_y, max_z)
+        computed_min = (min_x, min_y, min_z)
+    else:
+        computed_max = (FLT_MAX, FLT_MAX, FLT_MAX)
+        computed_min = (-FLT_MAX, -FLT_MAX, -FLT_MAX)
+
+    print("\n=== 合并结果 ===")
+    print("  总计: %d 顶点, %d 索引, %d 分块 (%d 地形 + %d 云), %d 子区间" % (
+        geo.vertex_count, geo.index_count,
+        terrain_chunk_count + cloud_chunk_count,
+        terrain_chunk_count, cloud_chunk_count,
+        geo.subchunk_count))
+    print("  包围盒: min=(%.1f, %.1f, %.1f) max=(%.1f, %.1f, %.1f)" % (
+        computed_min[0], computed_min[1], computed_min[2],
+        computed_max[0], computed_max[1], computed_max[2]))
+    print("  meshopt_version: %d" % inherited_meshopt_version)
+    if inherited_lod_raw:
+        print("  LOD0: %d 字节 %s" % (
+            len(inherited_lod_raw),
+            "(含烘焙数据)" if len(inherited_lod_raw) > len(LOD0_FIXED_BYTES) else "(默认)"))
+
+    # ---- 5. 构建 LevelMeshes ----
+    m = LevelMeshes()
+    m.version = 0x3C
+    m.max_pos = computed_max
+    m.min_pos = computed_min
+
+    # DESC: 优先从可逆 OBJ 继承, 否则新建
+    if inherited_desc_raw is not None:
+        m.desc_raw = inherited_desc_raw
+        m.desc = _parse_desc(inherited_desc_raw) if inherited_desc_raw else None
+    else:
+        m.desc = {
+            "timeStamp": int(time.time()),
+            "fileName": "",
+            "editor": "that-sky-level",
+            "editorVersion": [1, 0, 0],
+            "engineVersion": [0, 32, 2],
+        }
+        m.desc_raw = _nbt_write_desc(m.desc)
+
+    # LOD0: 优先从可逆 OBJ 继承 (含烘焙贴图/光照数据), 否则用默认值
+    m.lod_raw = inherited_lod_raw if inherited_lod_raw else LOD0_FIXED_BYTES
     m.geo = geo
     m.toc = None
     return m
@@ -2258,11 +2774,14 @@ def _detect_mode(input_path, output_path, explicit_mode=None):
 # ============================================================
 #  交互式 OBJ 选择菜单
 # ============================================================
-def _interactive_obj_selector(start_dir=None):
+def _interactive_obj_selector(start_dir=None, reversible_only=False):
     """
     交互式目录浏览 + OBJ 文件选择菜单。
     用户通过序号选择多个 .obj 文件。
     返回: 选中的文件路径列表, 或 None 表示取消。
+
+    reversible_only: True 时只显示可逆 OBJ (含 @MESHES_META),
+                     False 时只显示标准 OBJ (不含 @MESHES_META)。
     """
     if start_dir:
         current_dir = os.path.abspath(start_dir)
@@ -2271,6 +2790,9 @@ def _interactive_obj_selector(start_dir=None):
 
     selected = []  # 已选中的文件 (绝对路径)
     selected_set = set()
+
+    label = "可逆OBJ" if reversible_only else "标准OBJ"
+    title_hint = " (仅显示可逆OBJ, 含完整meshes数据)" if reversible_only else ""
 
     while True:
         # ---- 收集目录内容 ----
@@ -2288,11 +2810,17 @@ def _interactive_obj_selector(start_dir=None):
             if os.path.isdir(full):
                 subdirs.append(name)
             elif name.lower().endswith(".obj"):
-                obj_files.append(name)
+                is_rev = _is_reversible_obj(full)
+                if reversible_only and not is_rev:
+                    continue
+                if not reversible_only and is_rev:
+                    continue
+                obj_files.append((name, is_rev))
 
         # ---- 显示菜单 ----
         print("\n" + "=" * 60)
         print("当前目录: %s" % current_dir)
+        print("选择%s%s" % (label, title_hint))
         if selected:
             print("已选 %d 个文件:" % len(selected))
             for i, s in enumerate(selected):
@@ -2317,16 +2845,19 @@ def _interactive_obj_selector(start_dir=None):
             idx += 1
 
         # OBJ 文件
-        for f in obj_files:
-            full = os.path.join(current_dir, f)
-            mat = _material_from_filename(f)
+        for fname, is_rev in obj_files:
+            full = os.path.join(current_dir, fname)
+            mat = _material_from_filename(fname)
             mark = " *" if full in selected_set else "  "
-            print("  %2d.  [OBJ]%s %s  (%s)" % (idx, mark, f, mat))
+            tag = "[非法OBJ]" if is_rev else "[OBJ]"
+            print("  %2d.  %s%s %s  (%s)" % (idx, tag, mark, fname, mat))
             menu_items.append((idx, "obj", full))
             idx += 1
 
         if not obj_files and not subdirs:
             print("  (空目录)")
+        elif not obj_files:
+            print("  (当前目录无%s)" % label)
 
         print("-" * 60)
         print("操作: 输入序号选择/取消 OBJ, 'a' 全选当前目录, 'c' 清空, 'd' 完成, 'q' 取消")
@@ -2352,12 +2883,12 @@ def _interactive_obj_selector(start_dir=None):
 
         # 全选当前目录 OBJ
         if choice == "a":
-            for f in obj_files:
-                full = os.path.join(current_dir, f)
+            for fname, is_rev in obj_files:
+                full = os.path.join(current_dir, fname)
                 if full not in selected_set:
                     selected.append(full)
                     selected_set.add(full)
-            print("已全选当前目录的 %d 个 OBJ" % len(obj_files))
+            print("已全选当前目录的 %d 个 %s" % (len(obj_files), label))
             continue
 
         # 清空
@@ -2400,12 +2931,300 @@ def _interactive_obj_selector(start_dir=None):
                 print("已选择: %s" % os.path.basename(path))
 
 
+def _prompt_path(label, must_exist=False, default=None):
+    """提示输入文件路径, 返回路径或 None。"""
+    hint = ""
+    if default:
+        hint = " (回车=%s)" % default
+    try:
+        p = input("%s%s: " % (label, hint)).strip().strip('"').strip("'")
+    except (EOFError, KeyboardInterrupt):
+        print("\n已取消")
+        return None
+    if not p:
+        return default
+    if must_exist and not os.path.exists(p):
+        print("文件不存在: %s" % p)
+        return None
+    return p
+
+
+def _smart_output(input_path, ext):
+    """根据输入路径自动推导输出路径。"""
+    base = os.path.splitext(input_path)[0]
+    return base + "." + ext
+
+
+def interactive_menu():
+    """交互式菜单界面 — 方便选择转换方向。"""
+    print("=" * 60)
+    print("  That Sky Level .meshes 全方位转换器")
+    print("  纯 Python / 零依赖 / 适配 Termux")
+    print("=" * 60)
+
+    while True:
+        print("\n" + "-" * 60)
+        print("  --- meshes ↔ OBJ ---")
+        print("  1. .meshes → .obj  (可逆, 含全部信息, 可直接转回)")
+        print("  2. .meshes → .obj  (标准, 仅几何)")
+        print("  3. .obj → .meshes  (自动检测可逆/标准)")
+        print("  4. .meshes → 多个 .obj  (按材质拆分)")
+        print("  5. 多个 .obj → .meshes  (交互式, 可加入非法OBJ)")
+        print("  --- meshes ↔ JSON ---")
+        print("  6. .meshes → .json")
+        print("  7. .json → .meshes")
+        print("  --- 其他 ---")
+        print("  8. 查看文件信息")
+        print("  0. 退出")
+        print("-" * 60)
+
+        try:
+            choice = input("请选择 [0-8]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n再见！")
+            break
+
+        if choice == "0":
+            print("再见！")
+            break
+
+        elif choice == "1":
+            # meshes -> obj (可逆)
+            inp = _prompt_path("输入 .meshes", must_exist=True)
+            if not inp:
+                continue
+            outp = _prompt_path("输出 .obj", default=_smart_output(inp, "obj"))
+            if not outp:
+                continue
+            try:
+                with open(inp, "rb") as f:
+                    meshes = LevelMeshes.from_file_buffer(f.read())
+                obj = meshes_to_obj_full(meshes)
+                with open(outp, "w", encoding="utf-8") as f:
+                    f.write(obj)
+                print("\n已写出 (可逆): %s" % outp)
+                print_info(meshes)
+            except Exception as e:
+                print("转换失败: %s" % e)
+                import traceback
+                traceback.print_exc()
+
+        elif choice == "2":
+            # meshes -> obj (标准)
+            inp = _prompt_path("输入 .meshes", must_exist=True)
+            if not inp:
+                continue
+            outp = _prompt_path("输出 .obj", default=_smart_output(inp, "obj"))
+            if not outp:
+                continue
+            merge = input("合并为单个对象? (y/N): ").strip().lower() == "y"
+            try:
+                with open(inp, "rb") as f:
+                    meshes = LevelMeshes.from_file_buffer(f.read())
+                obj = touch_object(meshes, merge)
+                with open(outp, "w", encoding="utf-8") as f:
+                    f.write(obj)
+                print("\n已写出 (标准): %s" % outp)
+                print_info(meshes)
+            except Exception as e:
+                print("转换失败: %s" % e)
+
+        elif choice == "3":
+            # obj -> meshes
+            inp = _prompt_path("输入 .obj", must_exist=True)
+            if not inp:
+                continue
+            outp = _prompt_path("输出 .meshes", default=_smart_output(inp, "meshes"))
+            if not outp:
+                continue
+            try:
+                with open(inp, "r", encoding="utf-8") as f:
+                    obj_text = f.read()
+                has_meta = META_BEGIN in obj_text
+                meshes = obj_to_meshes(obj_text)
+                data = meshes.to_file_buffer()
+                with open(outp, "wb") as f:
+                    f.write(data)
+                method = "精确还原 (可逆OBJ)" if has_meta else "BFS 邻接分块 (标准OBJ)"
+                print("\n转换方式: %s" % method)
+                print("已写出: %s" % outp)
+                print_info(meshes)
+            except Exception as e:
+                print("转换失败: %s" % e)
+                import traceback
+                traceback.print_exc()
+
+        elif choice == "4":
+            # meshes -> 多个 obj (按材质拆分)
+            inp = _prompt_path("输入 .meshes", must_exist=True)
+            if not inp:
+                continue
+            outp = _prompt_path("输出基础路径 (如 output)", default=_smart_output(inp, "obj"))
+            if not outp:
+                continue
+            use_sub = input("使用 subchunk 材质区间? (y/N): ").strip().lower() == "y"
+            try:
+                with open(inp, "rb") as f:
+                    meshes = LevelMeshes.from_file_buffer(f.read())
+                results = touch_object_multi(meshes, outp, use_sub)
+                print("\n共输出 %d 个材质 OBJ:" % len(results))
+                for mat_id, mat_name, path, vc, fc in results:
+                    print("  %s (ID=%d): %d 顶点, %d 面" % (mat_name, mat_id, vc, fc))
+            except Exception as e:
+                print("转换失败: %s" % e)
+
+        elif choice == "5":
+            # 多 obj -> meshes (交互式, 可选加入非法OBJ)
+            start_dir = _prompt_path("起始目录 (回车=当前目录)", default=os.getcwd())
+            if not start_dir:
+                continue
+
+            # ---- 阶段1: 选择标准 OBJ ----
+            print("\n" + "=" * 60)
+            print("阶段 1/2: 选择标准 OBJ (材质由文件名确定)")
+            print("=" * 60)
+            standard_paths = _interactive_obj_selector(start_dir, reversible_only=False)
+
+            if standard_paths is None:
+                print("已取消")
+                continue
+
+            # ---- 阶段2: 选择可逆 OBJ (非法OBJ, 可选) ----
+            full_paths = []
+            print("\n" + "=" * 60)
+            print("阶段 2/2: 是否加入非法OBJ (可逆OBJ, 含完整meshes数据)?")
+            print("=" * 60)
+            try:
+                add_full = input("加入非法OBJ? (y/N): ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print("\n已取消")
+                continue
+
+            if add_full == "y":
+                full_start_dir = _prompt_path(
+                    "非法OBJ 起始目录 (回车=同上)", default=start_dir)
+                if not full_start_dir:
+                    continue
+                print("\n" + "=" * 60)
+                print("选择非法OBJ (可逆OBJ, 仅显示含 @MESHES_META 的文件)")
+                print("=" * 60)
+                full_paths = _interactive_obj_selector(full_start_dir, reversible_only=True)
+
+                if full_paths is None:
+                    print("已取消")
+                    continue
+
+            if not standard_paths and not full_paths:
+                print("未选择任何文件")
+                continue
+
+            outp = _prompt_path("输出 .meshes", default="output.meshes")
+            if not outp:
+                continue
+            if not outp.endswith(".meshes"):
+                outp += ".meshes"
+
+            # ---- 确认 ----
+            print("\n" + "=" * 60)
+            print("已选文件:")
+            if standard_paths:
+                print("  [标准OBJ] %d 个:" % len(standard_paths))
+                for p in standard_paths:
+                    mat = _material_from_filename(p)
+                    print("    %s -> %s" % (os.path.basename(p), mat))
+            if full_paths:
+                print("  [非法OBJ] %d 个:" % len(full_paths))
+                for p in full_paths:
+                    print("    %s" % os.path.basename(p))
+            print("输出: %s" % outp)
+            try:
+                confirm = input("\n确认转换? (回车=继续, q=取消): ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print("\n已取消")
+                continue
+            if confirm == "q":
+                print("已取消")
+                continue
+
+            try:
+                if full_paths:
+                    # 混合模式: 标准 + 非法
+                    meshes = multi_obj_to_meshes_mixed(standard_paths, full_paths)
+                else:
+                    # 纯标准模式 (兼容原有行为)
+                    meshes = multi_obj_to_meshes(standard_paths)
+                data = meshes.to_file_buffer()
+                with open(outp, "wb") as f:
+                    f.write(data)
+                print("\n已写出: %s" % outp)
+                print_info(meshes)
+            except Exception as e:
+                print("转换失败: %s" % e)
+                import traceback
+                traceback.print_exc()
+
+        elif choice == "6":
+            # meshes -> json
+            inp = _prompt_path("输入 .meshes", must_exist=True)
+            if not inp:
+                continue
+            outp = _prompt_path("输出 .json", default=_smart_output(inp, "json"))
+            if not outp:
+                continue
+            try:
+                with open(inp, "rb") as f:
+                    meshes = LevelMeshes.from_file_buffer(f.read())
+                j = meshes_to_json(meshes)
+                text = json.dumps(j, indent=2, ensure_ascii=False)
+                with open(outp, "w", encoding="utf-8") as f:
+                    f.write(text)
+                print("\n已写出: %s" % outp)
+            except Exception as e:
+                print("转换失败: %s" % e)
+
+        elif choice == "7":
+            # json -> meshes
+            inp = _prompt_path("输入 .json", must_exist=True)
+            if not inp:
+                continue
+            outp = _prompt_path("输出 .meshes", default=_smart_output(inp, "meshes"))
+            if not outp:
+                continue
+            try:
+                with open(inp, "r", encoding="utf-8") as f:
+                    j = json.loads(f.read())
+                meshes = json_to_meshes(j)
+                data = meshes.to_file_buffer()
+                with open(outp, "wb") as f:
+                    f.write(data)
+                print("\n已写出: %s" % outp)
+            except Exception as e:
+                print("转换失败: %s" % e)
+
+        elif choice == "8":
+            # 查看文件信息
+            inp = _prompt_path("输入 .meshes", must_exist=True)
+            if not inp:
+                continue
+            try:
+                with open(inp, "rb") as f:
+                    meshes = LevelMeshes.from_file_buffer(f.read())
+                print_info(meshes)
+            except Exception as e:
+                print("解析失败: %s" % e)
+
+        else:
+            print("无效选择: %s" % choice)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="That Sky Level .meshes 全方位转换器 (纯 Python / Termux)")
     parser.add_argument("-i", "--input", help="输入文件")
     parser.add_argument("-o", "--output", help="输出文件 (省略且非 --info 时打印到 stdout)")
     parser.add_argument("-m", "--merge", action="store_true", help="meshes->obj 时合并为单个对象")
+    parser.add_argument("--full", action="store_true",
+                        help="meshes->obj 时生成可逆 OBJ (含全部信息, 可直接转回)")
     parser.add_argument("--info", action="store_true", help="仅打印 .meshes 文件信息")
     parser.add_argument("--split-material", action="store_true",
                         help="meshes->obj 时按材质拆分多个 OBJ (顶点取权重最大材质, 面取多数投票)")
@@ -2413,22 +3232,44 @@ def main(argv=None):
                         help="配合 --split-material: 使用 subchunk 材质区间 (游戏原始分配) 而非顶点权重")
     parser.add_argument("--multi-obj", action="store_true",
                         help="多 OBJ -> meshes: 启动交互式菜单选择 OBJ (以文件名确定材质, 交界处权重过渡)")
+    parser.add_argument("--include-full", action="store_true",
+                        help="配合 --multi-obj: 额外选择可逆OBJ (非法OBJ, 含完整meshes数据) 合并")
     parser.add_argument("--dir", metavar="PATH", help="交互式菜单的起始目录 (配合 --multi-obj)")
-    parser.add_argument("--mode", choices=["m2o", "o2m", "m2j", "j2m"],
-                        help="显式指定转换方向: m2o=meshes->obj, o2m=obj->meshes, "
-                             "m2j=meshes->json, j2m=json->meshes")
+    parser.add_argument("--mode", choices=["m2o", "m2of", "o2m", "m2j", "j2m"],
+                        help="显式指定转换方向: m2o=meshes->obj(标准), m2of=meshes->obj(可逆), "
+                             "o2m=obj->meshes, m2j=meshes->json, j2m=json->meshes")
     args = parser.parse_args(argv)
 
-    # --multi-obj 模式 (交互式多 OBJ -> meshes)
+    # 无参数时启动交互式菜单
+    if not argv and len(sys.argv) <= 1:
+        interactive_menu()
+        return 0
+
+    # --multi-obj 模式 (交互式多 OBJ -> meshes, 可选加入非法OBJ)
     if args.multi_obj:
-        # 交互式选择 OBJ 文件
+        # ---- 阶段1: 选择标准 OBJ ----
         print("=" * 60)
-        print("多 OBJ -> meshes 交互式选择")
-        print("以文件名确定材质, 交界处顶点权重过渡")
+        print("阶段 1/2: 选择标准 OBJ (材质由文件名确定)")
         print("=" * 60)
 
-        obj_paths = _interactive_obj_selector(args.dir)
-        if not obj_paths:
+        standard_paths = _interactive_obj_selector(args.dir, reversible_only=False)
+        if standard_paths is None:
+            print("已取消, 退出")
+            return 0
+
+        # ---- 阶段2: 选择可逆 OBJ (非法OBJ, 可选) ----
+        full_paths = []
+        if args.include_full:
+            print("\n" + "=" * 60)
+            print("阶段 2/2: 选择非法OBJ (可逆OBJ, 含完整meshes数据)")
+            print("=" * 60)
+
+            full_paths = _interactive_obj_selector(args.dir, reversible_only=True)
+            if full_paths is None:
+                print("已取消, 退出")
+                return 0
+
+        if not standard_paths and not full_paths:
             print("未选择任何文件, 退出")
             return 0
 
@@ -2447,10 +3288,17 @@ def main(argv=None):
             out_path += ".meshes"
 
         # 确认
-        print("\n已选文件:")
-        for p in obj_paths:
-            mat = _material_from_filename(p)
-            print("  %s -> %s" % (os.path.basename(p), mat))
+        print("\n" + "=" * 60)
+        print("已选文件:")
+        if standard_paths:
+            print("  [标准OBJ] %d 个:" % len(standard_paths))
+            for p in standard_paths:
+                mat = _material_from_filename(p)
+                print("    %s -> %s" % (os.path.basename(p), mat))
+        if full_paths:
+            print("  [非法OBJ] %d 个:" % len(full_paths))
+            for p in full_paths:
+                print("    %s" % os.path.basename(p))
         print("输出: %s" % out_path)
         try:
             confirm = input("\n确认转换? (回车=继续, q=取消): ").strip().lower()
@@ -2462,7 +3310,10 @@ def main(argv=None):
             return 0
 
         try:
-            meshes = multi_obj_to_meshes(obj_paths)
+            if full_paths:
+                meshes = multi_obj_to_meshes_mixed(standard_paths, full_paths)
+            else:
+                meshes = multi_obj_to_meshes(standard_paths)
             data = meshes.to_file_buffer()
             with open(out_path, "wb") as f:
                 f.write(data)
@@ -2499,7 +3350,7 @@ def main(argv=None):
     mode = _detect_mode(args.input, args.output or "", args.mode)
 
     try:
-        if mode == "m2o":
+        if mode in ("m2o", "m2of"):
             # meshes -> obj
             with open(args.input, "rb") as f:
                 buffer = f.read()
@@ -2516,6 +3367,16 @@ def main(argv=None):
                 for mat_id, mat_name, path, vc, fc in results:
                     print("  %s (ID=%d): %d 顶点, %d 面" % (mat_name, mat_id, vc, fc))
                 print_info(meshes)
+            elif mode == "m2of" or args.full:
+                # 可逆 OBJ (含全部信息)
+                obj = meshes_to_obj_full(meshes)
+                if args.output:
+                    with open(args.output, "w", encoding="utf-8") as f:
+                        f.write(obj)
+                    print("已写出 (可逆): %s" % args.output)
+                    print_info(meshes)
+                else:
+                    sys.stdout.write(obj)
             else:
                 obj = touch_object(meshes, args.merge)
                 if args.output:
@@ -2527,13 +3388,16 @@ def main(argv=None):
                     sys.stdout.write(obj)
 
         elif mode == "o2m":
-            # obj -> meshes
+            # obj -> meshes (自动检测可逆/标准)
             with open(args.input, "r", encoding="utf-8") as f:
                 obj_text = f.read()
+            has_meta = META_BEGIN in obj_text
             meshes = obj_to_meshes(obj_text)
             data = meshes.to_file_buffer()
             with open(args.output, "wb") as f:
                 f.write(data)
+            method = "精确还原 (可逆OBJ)" if has_meta else "BFS 邻接分块 (标准OBJ)"
+            print("转换方式: %s" % method)
             print("已写出: %s" % args.output)
             print_info(meshes)
 
